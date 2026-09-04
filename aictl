@@ -1,0 +1,922 @@
+#!/bin/bash
+# aictl - AI Stack Controller
+# Manages llama-swap, containers, and GPU inference on AMD Strix Halo.
+set -euo pipefail
+
+# =============================================================================
+# SCRIPT & CONFIG AUTO-DETECTION
+# =============================================================================
+# Resolve directory portably, following symlinks
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -L "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_TARGET="$(readlink -f "${BASH_SOURCE[0]}")"
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_TARGET")" && pwd)"
+fi
+
+# Config paths
+LLAMA_SWAP_CONFIG="${LLAMA_SWAP_CONFIG:-$SCRIPT_DIR/llama-swap.yaml}"
+COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/podman-compose.yaml}"
+LLAMA_SWAP_URL="${LLAMA_SWAP_URL:-http://localhost:8090}"
+
+# API key from external secure env file
+[ -f "$HOME/.config/aictl/env" ] && source "$HOME/.config/aictl/env"
+API_KEY="${LLAMA_SWAP_API_KEY:-}"
+
+# Helper to parse values dynamically from llama-swap.yaml
+_extract_yaml_macro() {
+    local key="$1"
+    awk -v k="$key" '
+        /^macros:/ { in_macros=1; next }
+        /^[a-z]/ { in_macros=0 }
+        in_macros && $0 ~ "^  " k ":" {
+            sub("^  " k ":[ \t]*", "")
+            print
+            exit
+        }
+    ' "$LLAMA_SWAP_CONFIG" 2>/dev/null || true
+}
+
+_extract_rocm_image() {
+    awk '
+        /^macros:/ { in_macros=1; next }
+        /^[a-z]/ { in_macros=0 }
+        in_macros && /kyuz0-rocm[0-9]*:/ { in_rocm=1; next }
+        in_rocm && /^[a-z]/ { in_rocm=0 }
+        in_rocm && /docker\.io\/|kyuz0\// {
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /kyuz0\/amd-strix-halo-toolboxes/) {
+                    print $i
+                    exit
+                }
+            }
+        }
+    ' "$LLAMA_SWAP_CONFIG" 2>/dev/null || echo "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0"
+}
+
+_extract_models_path() {
+    local p
+    p=$(_extract_yaml_macro "models-path")
+    [[ -n "$p" ]] && echo "$p" || echo "/mnt/AI-AND-GAMES/ai-models"
+}
+
+# Auto-discovered paths and images (overridable via env)
+MODELS_PATH="${MODELS_PATH:-$(_extract_models_path)}"
+ROCM_IMAGE="${ROCM_IMAGE:-$(_extract_rocm_image)}"
+BENCH_IMAGE="$ROCM_IMAGE"
+
+# =============================================================================
+# COLORS & FORMATTING
+# =============================================================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+_ok()     { echo -e "${GREEN}✓${NC} $*"; }
+_warn()   { echo -e "${YELLOW}!${NC} $*"; }
+_err()    { echo -e "${RED}✗${NC} $*" >&2; }
+_header() { echo -e "\n${BOLD}${BLUE}=== $* ===${NC}"; }
+
+# =============================================================================
+# API HELPERS
+# =============================================================================
+_api() {
+    curl -sf -H "Authorization: Bearer ${API_KEY}" "${LLAMA_SWAP_URL}${1}"
+}
+
+_api_post() {
+    local path="$1"; shift
+    curl -sf -X POST \
+        -H "Authorization: Bearer ${API_KEY}" \
+        -H "Content-Type: application/json" \
+        -d "$1" \
+        "${LLAMA_SWAP_URL}${path}"
+}
+
+_llama_alive() {
+    curl -sf --max-time 2 "${LLAMA_SWAP_URL}/v1/models" \
+        -H "Authorization: Bearer ${API_KEY}" > /dev/null 2>&1
+}
+
+# =============================================================================
+# =============================================================================
+# SERVICE COMMANDS
+# =============================================================================
+
+cmd_start() {
+    echo "Starting llama-swap..."
+    systemctl --user start llama-swap
+    _ok "llama-swap started: ${LLAMA_SWAP_URL}/ui"
+    echo "Starting ai-stack (SearxNG, Redis, Speaches, Open WebUI)..."
+    systemctl --user start ai-stack
+    _ok "ai-stack started."
+}
+
+cmd_stop() {
+    echo "Stopping llama-swap..."
+    systemctl --user stop llama-swap
+    _ok "llama-swap stopped."
+    echo "Stopping ai-stack..."
+    systemctl --user stop ai-stack
+    _ok "ai-stack stopped."
+}
+
+cmd_restart() {
+    echo "Restarting llama-swap..."
+    systemctl --user restart llama-swap
+    _ok "llama-swap restarted."
+    echo "Restarting ai-stack..."
+    systemctl --user restart ai-stack
+    _ok "ai-stack restarted."
+}
+
+# =============================================================================
+# HARDWARE & TELEMETRY
+# =============================================================================
+
+_print_telemetry() {
+    local gtt_total_bytes=0 gtt_used_bytes=0
+    for f in /sys/class/drm/card*/device/mem_info_gtt_total; do
+        [[ -f "$f" ]] && gtt_total_bytes=$(cat "$f")
+    done
+    for f in /sys/class/drm/card*/device/mem_info_gtt_used; do
+        [[ -f "$f" ]] && gtt_used_bytes=$(cat "$f")
+    done
+
+    local gpu_busy=0
+    for f in /sys/class/drm/card*/device/gpu_busy_percent; do
+        [[ -f "$f" ]] && gpu_busy=$(cat "$f")
+    done
+
+    local temp_c=0
+    for f in /sys/class/drm/card*/device/hwmon/hwmon*/temp1_input; do
+        if [[ -f "$f" ]]; then
+            local raw
+            raw=$(cat "$f")
+            temp_c=$(( raw / 1000 ))
+        fi
+    done
+
+    local power_w=0
+    for f in /sys/class/drm/card*/device/hwmon/hwmon*/power1_average; do
+        if [[ -f "$f" ]]; then
+            local raw
+            raw=$(cat "$f")
+            power_w=$(( raw / 1000000 ))
+        fi
+    done
+
+    echo -e "\n${BOLD}Hardware & Telemetry (Strix Halo gfx1151):${NC}"
+    if [[ $gtt_total_bytes -gt 0 ]]; then
+        local gtt_total_gb gtt_used_gb gtt_pct
+        gtt_total_gb=$(awk "BEGIN {printf \"%.1f\", $gtt_total_bytes/1073741824}")
+        gtt_used_gb=$(awk "BEGIN {printf \"%.1f\", $gtt_used_bytes/1073741824}")
+        gtt_pct=$(awk "BEGIN {printf \"%.1f\", ($gtt_used_bytes/$gtt_total_bytes)*100}")
+        echo -e "  GTT Memory:  ${CYAN}${gtt_used_gb}${NC} / ${gtt_total_gb} GB (${gtt_pct}%)"
+    fi
+    echo -e "  GPU Load:    ${CYAN}${gpu_busy}%${NC} busy"
+    [[ $temp_c -gt 0 ]] && echo -e "  Junction:    ${CYAN}${temp_c}°C${NC}"
+    [[ $power_w -gt 0 ]] && echo -e "  Board Power: ${CYAN}${power_w} W${NC}"
+}
+
+cmd_status() {
+    _header "AI Stack Status"
+
+    # llama-swap service
+    echo -e "\n${BOLD}llama-swap:${NC}"
+    systemctl --user status llama-swap --no-pager 2>&1 | grep -E "Active:|Loaded:" | sed 's/^/  /'
+
+    # Containers
+    echo -e "\n${BOLD}Containers:${NC}"
+    if podman ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null | grep -E "searxng|open-webui|speaches|NAME" ; then
+        true
+    else
+        _warn "  No matching containers running (or podman unavailable)"
+    fi
+
+    # Hardware Telemetry
+    _print_telemetry
+
+    # Loaded models
+    echo -e "\n${BOLD}Loaded models:${NC}"
+    if _llama_alive; then
+        local running
+        running=$(_api "/running" 2>/dev/null || echo "{}")
+        if echo "$running" | jq -e '.running | length > 0' > /dev/null 2>&1; then
+            echo "$running" | jq -r '.running[] | "  \(.model)  [\(.state)]"'
+        else
+            echo "  (none loaded)"
+        fi
+    else
+        _warn "  llama-swap not responding"
+    fi
+
+    # Available models count
+    echo -e "\n${BOLD}Available models:${NC}"
+    if _llama_alive; then
+        local count
+        count=$(_api "/v1/models" | jq '.data | length')
+        echo "  ${count} models configured  (run: aictl models)"
+    else
+        _warn "  llama-swap not responding"
+    fi
+}
+
+cmd_doctor() {
+    local script="$SCRIPT_DIR/scripts/check-stack.py"
+    if [[ ! -f "$script" ]]; then
+        _err "Diagnostics script not found: $script"
+        exit 1
+    fi
+    python3 "$script" "$@"
+}
+
+cmd_logs() {
+    local service="${1:-llama-swap}"
+    case "$service" in
+        llama-swap|swap)
+            journalctl --user -u llama-swap -f
+            ;;
+        searxng)
+            podman logs -f searxng
+            ;;
+        open-webui|webui)
+            podman logs -f open-webui
+            ;;
+        speaches|voice)
+            podman logs -f speaches
+            ;;
+        redis|searxng-redis)
+            podman logs -f searxng-redis
+            ;;
+        *)
+            _err "Unknown service: $service"
+            echo "  Usage: aictl logs [llama-swap|searxng|redis|open-webui|speaches]"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# MODEL COMMANDS
+# =============================================================================
+
+cmd_models() {
+    local json_output=0
+    [[ "${1:-}" == "--json" ]] && json_output=1
+
+    if ! _llama_alive; then
+        _err "llama-swap is not responding at ${LLAMA_SWAP_URL}"
+        exit 1
+    fi
+
+    local models_raw running_raw
+    models_raw=$(_api "/v1/models")
+    running_raw=$(_api "/running" 2>/dev/null || echo '{"running":[]}')
+
+    if [[ $json_output -eq 1 ]]; then
+        echo "$models_raw" | jq .
+        return 0
+    fi
+
+    _header "Available Models"
+    echo -e "  Container image: ${CYAN}${ROCM_IMAGE}${NC}\n"
+
+    # Listing is driven entirely by what llama-swap serves — no hardcoded model
+    # IDs here, so adding/removing a model in llama-swap.yaml needs no aictl edit.
+    local loaded_ids
+    loaded_ids=$(echo "$running_raw" | jq -r '.running[]?.model // empty')
+
+    echo "$models_raw" | jq -r '
+        .data[]
+        | [ .id,
+            (.name // ""),
+            (.description // ""),
+            ((.meta.llamaswap.aliases // []) | join(", "))
+          ] | @tsv' |
+    while IFS=$'\t' read -r id name desc aliases; do
+        [[ -z "$id" ]] && continue
+        local status
+        if echo "$loaded_ids" | grep -qx "$id"; then
+            status="${GREEN}[loaded]${NC}"
+        else
+            status="[idle]"
+        fi
+        echo -e "  ${BLUE}•${NC} ${BOLD}$(printf '%-8s' "$id")${NC} ${status}  ${name}"
+        [[ -n "$desc" ]]    && echo -e "      ${desc}"
+        [[ -n "$aliases" ]] && echo -e "      aliases: ${CYAN}${aliases}${NC}"
+        echo ""
+    done
+}
+
+cmd_swap() {
+    local model="${1:-}"
+    if [[ -z "$model" ]]; then
+        _err "Usage: aictl swap <model>"
+        exit 1
+    fi
+
+    echo -e "Preloading model: ${BOLD}${model}${NC}..."
+    if _api "/upstream/${model}" > /dev/null; then
+        _ok "Model '${model}' preloaded."
+    else
+        _err "Failed to preload model '${model}'. Check model name with: aictl models"
+        exit 1
+    fi
+}
+
+cmd_unload() {
+    local model="${1:-}"
+    if [[ -z "$model" ]]; then
+        echo "Unloading all models..."
+        if _api_post "/api/models/unload" '{}' > /dev/null; then
+            _ok "All models unloaded."
+        else
+            _err "Failed to unload models."
+            exit 1
+        fi
+    else
+        echo -e "Unloading model: ${BOLD}${model}${NC}..."
+        if _api_post "/api/models/unload" "{\"model\":\"${model}\"}" > /dev/null; then
+            _ok "Model '${model}' unloaded."
+        else
+            _err "Failed to unload model '${model}'."
+            exit 1
+        fi
+    fi
+}
+
+cmd_download() {
+    local script="${SCRIPT_DIR}/scripts/turbo-download"
+    if [[ ! -x "$script" ]]; then
+        _err "turbo-download script not found or not executable at: ${script}"
+        exit 1
+    fi
+    exec "$script" "$@"
+}
+
+# =============================================================================
+# TEST / SMOKE COMMAND (Single stream, safe)
+# =============================================================================
+
+cmd_test() {
+    local model="${1:-main}"
+    local prompt="${2:-State in 1 concise sentence that you are operational and ready.}"
+
+    if ! _llama_alive; then
+        _err "llama-swap is not responding at ${LLAMA_SWAP_URL}"
+        exit 1
+    fi
+
+    _header "Testing Model: ${model}"
+    echo -e "  Prompt: \"${prompt}\"\n"
+
+    local payload response
+    payload=$(jq -n \
+        --arg m "$model" \
+        --arg p "$prompt" \
+        '{model: $m, messages: [{role: "user", content: $p}], max_tokens: 250}')
+
+    local t0 t1 wall_ms
+    t0=$(date +%s%3N)
+    response=$(_api_post "/v1/chat/completions" "$payload" || true)
+    t1=$(date +%s%3N)
+    wall_ms=$(( t1 - t0 ))
+
+    if [[ -z "$response" ]] || ! echo "$response" | jq -e '.choices' > /dev/null 2>&1; then
+        _err "Test failed for model '${model}'. Response:"
+        echo "$response"
+        return 1
+    fi
+
+    local content reasoning cached_toks prompt_toks gen_toks pp_s gen_s draft_n draft_acc
+    content=$(echo "$response" | jq -r '.choices[0].message.content // ""')
+    reasoning=$(echo "$response" | jq -r '.choices[0].message.reasoning_content // ""')
+    cached_toks=$(echo "$response" | jq -r '.usage.prompt_tokens_details.cached_tokens // 0')
+    prompt_toks=$(echo "$response" | jq -r '.timings.prompt_n // .usage.prompt_tokens // 0')
+    gen_toks=$(echo "$response" | jq -r '.timings.predicted_n // .usage.completion_tokens // 0')
+    pp_s=$(echo "$response" | jq -r '.timings.prompt_per_second // 0' | awk '{printf "%.1f", $1}')
+    gen_s=$(echo "$response" | jq -r '.timings.predicted_per_second // 0' | awk '{printf "%.1f", $1}')
+    draft_n=$(echo "$response" | jq -r '.timings.draft_n // 0')
+    draft_acc=$(echo "$response" | jq -r '.timings.draft_n_accepted // 0')
+
+    if [[ -n "$reasoning" ]]; then
+        echo -e "${BOLD}Reasoning:${NC}\n${reasoning}\n"
+    fi
+    echo -e "${BOLD}Response:${NC}\n${content}\n"
+
+    _header "Metrics"
+    echo "  Wall time:       ${wall_ms} ms"
+    echo "  Prompt tokens:   ${prompt_toks} tokens (${pp_s} tok/s)"
+    echo "  Prompt cached:   ${cached_toks} tokens"
+    echo "  Generated:       ${gen_toks} tokens (${gen_s} tok/s)"
+    if [[ "$draft_n" -gt 0 ]]; then
+        local acc_pct
+        acc_pct=$(awk -v n="$draft_n" -v a="$draft_acc" 'BEGIN {printf "%.1f%%", (a/n)*100}')
+        echo "  MTP Draft:       ${draft_acc}/${draft_n} accepted (${acc_pct})"
+    fi
+    echo ""
+}
+
+# =============================================================================
+# WARMUP
+# =============================================================================
+
+cmd_warmup() {
+    local model="${1:-main}"
+    local warmup_all=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all) warmup_all=1; shift ;;
+            *)     model="$1"; shift ;;
+        esac
+    done
+
+    local -a targets=()
+    if [[ $warmup_all -eq 1 ]]; then
+        targets=("main" "tiny" "think")
+    else
+        targets=("$model")
+    fi
+
+    for m in "${targets[@]}"; do
+        if ! _llama_alive; then
+            _err "llama-swap is not responding at ${LLAMA_SWAP_URL}"
+            exit 1
+        fi
+
+        local payload response t0 t1 wall_ms
+        payload=$(jq -n --arg m "$m" \
+            '{model: $m, messages: [{role: "user", content: "."}], max_tokens: 1}')
+
+        t0=$(date +%s%3N)
+        response=$(_api_post "/v1/chat/completions" "$payload" || true)
+        t1=$(date +%s%3N)
+        wall_ms=$(( t1 - t0 ))
+
+        if [[ -z "$response" ]] || ! echo "$response" | jq -e '.choices' > /dev/null 2>&1 || [[ -z "$(echo "$response" | jq -r '.choices[0] // empty')" ]]; then
+            _err "Warmup failed for model '${m}' (took ${wall_ms}ms). Response:"
+            echo "$response"
+            exit 1
+        fi
+
+        _ok "Warmup complete: ${m} (took ${wall_ms}ms)"
+    done
+}
+
+# =============================================================================
+# MEMORY & HARDWARE STATUS
+# =============================================================================
+
+cmd_mem() {
+    _header "Memory Status"
+
+    # System RAM
+    echo -e "\n${BOLD}System RAM:${NC}"
+    local mem_total mem_available mem_used_kb mem_total_h mem_avail_h mem_used_h
+    mem_total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    mem_available=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+    mem_used_kb=$(( mem_total - mem_available ))
+    mem_total_h=$(( mem_total / 1024 / 1024 ))
+    mem_avail_h=$(( mem_available / 1024 / 1024 ))
+    mem_used_h=$(( mem_used_kb / 1024 / 1024 ))
+    echo "  Total:     ${mem_total_h} GB"
+    echo "  Used:      ${mem_used_h} GB"
+    echo "  Available: ${mem_avail_h} GB"
+
+    # GTT Memory (GPU shared memory)
+    echo -e "\n${BOLD}GTT Aperture (GPU shared memory):${NC}"
+    local gtt_total_bytes=0 gtt_used_bytes=0
+    for f in /sys/class/drm/card*/device/mem_info_gtt_total; do
+        [[ -f "$f" ]] && gtt_total_bytes=$(cat "$f")
+    done
+    for f in /sys/class/drm/card*/device/mem_info_gtt_used; do
+        [[ -f "$f" ]] && gtt_used_bytes=$(cat "$f")
+    done
+    if [[ $gtt_total_bytes -gt 0 ]]; then
+        local gtt_total_gb gtt_used_gb gtt_free_gb
+        gtt_total_gb=$(( gtt_total_bytes / 1073741824 ))
+        gtt_used_gb=$(( gtt_used_bytes / 1073741824 ))
+        gtt_free_gb=$(( (gtt_total_bytes - gtt_used_bytes) / 1073741824 ))
+        echo "  Total:     ${gtt_total_gb} GB"
+        echo "  Used:      ${gtt_used_gb} GB"
+        echo "  Free:      ${gtt_free_gb} GB"
+    else
+        _warn "  GTT info not available"
+    fi
+
+    # VRAM
+    echo -e "\n${BOLD}VRAM (dedicated GPU memory):${NC}"
+    local vram_total_bytes=0 vram_used_bytes=0
+    for f in /sys/class/drm/card*/device/mem_info_vram_total; do
+        [[ -f "$f" ]] && vram_total_bytes=$(cat "$f")
+    done
+    for f in /sys/class/drm/card*/device/mem_info_vram_used; do
+        [[ -f "$f" ]] && vram_used_bytes=$(cat "$f")
+    done
+    if [[ $vram_total_bytes -gt 0 ]]; then
+        local vram_total_mb vram_used_mb vram_free_mb
+        vram_total_mb=$(( vram_total_bytes / 1048576 ))
+        vram_used_mb=$(( vram_used_bytes / 1048576 ))
+        vram_free_mb=$(( (vram_total_bytes - vram_used_bytes) / 1048576 ))
+        echo "  Total:     ${vram_total_mb} MB"
+        echo "  Used:      ${vram_used_mb} MB"
+        echo "  Free:      ${vram_free_mb} MB"
+    else
+        _warn "  VRAM info not available"
+    fi
+
+    # Loaded models
+    echo -e "\n${BOLD}Loaded models:${NC}"
+    if _llama_alive; then
+        local running
+        running=$(_api "/running" 2>/dev/null || echo "{}")
+        if echo "$running" | jq -e '.running | length > 0' > /dev/null 2>&1; then
+            echo "$running" | jq -r '.running[] | "  \(.model)  [\(.state)]"'
+        else
+            echo "  (none loaded)"
+        fi
+    else
+        _warn "  llama-swap not responding"
+    fi
+
+    echo ""
+}
+
+# =============================================================================
+# BENCHMARK HELPERS
+# =============================================================================
+
+_resolve_model_path() {
+    local model="$1"
+
+    local macro_name
+    macro_name=$(awk -v m="$model" '
+        /^models:/ { in_models=1; next }
+        /^[a-z]/ { in_models=0 }
+        in_models && $0 ~ "^  " m ":" { found=1; next }
+        found && /^  [^ ]/ { exit }
+        found && /\$\{[^}]*-model\}/ {
+            sub(/.*\$\{/, ""); sub(/\}.*/, "")
+            print; exit
+        }
+    ' "$LLAMA_SWAP_CONFIG")
+
+    [[ -z "$macro_name" ]] && return 1
+
+    awk -v m="$macro_name" '
+        /^macros:/ { in_macros=1; next }
+        /^[a-z]/ { in_macros=0 }
+        in_macros && $0 ~ "^  " m ":" { found=1; next }
+        found && /^  [^ ]/ { exit }
+        found && /-m / {
+            sub(/.*-m /, ""); sub(/ .*/, "")
+            print; exit
+        }
+    ' "$LLAMA_SWAP_CONFIG"
+}
+
+_list_bench_models() {
+    awk '
+        /^models:/ { in_models=1; next }
+        /^[a-z]/ { in_models=0 }
+        in_models && /^  [a-zA-Z0-9_-]+:/ {
+            sub(/:.*/, ""); gsub(/^ +/, "")
+            print
+        }
+    ' "$LLAMA_SWAP_CONFIG"
+}
+
+_dedup_models() {
+    local -a seen_paths=()
+    while read -r model; do
+        local path
+        path=$(_resolve_model_path "$model" || true)
+        [[ -z "$path" ]] && continue
+        local dup=0
+        for s in "${seen_paths[@]}"; do
+            [[ "$s" == "$path" ]] && { dup=1; break; }
+        done
+        if [[ $dup -eq 0 ]]; then
+            seen_paths+=("$path")
+            echo "$model"
+        fi
+    done
+}
+
+_run_raw_llama_bench() {
+    local model="" prompt_sizes="512,1024,2048" gen_tokens="128" reps="3"
+    local bench_all=0 output_format="md"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)      bench_all=1; shift ;;
+            -p)         prompt_sizes="${2:-}"; shift 2 ;;
+            -n)         gen_tokens="${2:-}"; shift 2 ;;
+            -r)         reps="${2:-}"; shift 2 ;;
+            -o)         output_format="${2:-}"; shift 2 ;;
+            -h|--help)
+                echo -e "${BOLD}Usage:${NC}  aictl bench raw <model> [options]"
+                echo -e "        aictl bench raw --all [options]"
+                echo ""
+                echo -e "${BOLD}Options:${NC}"
+                echo "  -p <sizes>    Prompt token counts  (default: 512,1024,2048)"
+                echo "  -n <tokens>   Tokens to generate   (default: 128)"
+                echo "  -r <count>    Repetitions          (default: 3)"
+                echo "  -o <format>   Output: md csv json jsonl (default: md)"
+                echo "  --all         Bench all unique models"
+                return 0
+                ;;
+            -*)         _err "Unknown flag: $1 (try: aictl bench raw --help)"; exit 1 ;;
+            *)          model="$1"; shift ;;
+        esac
+    done
+
+    local -a models=()
+    if [[ $bench_all -eq 1 ]]; then
+        while read -r m; do models+=("$m"); done < <(_list_bench_models | _dedup_models)
+    elif [[ -n "$model" ]]; then
+        models=("$model")
+    else
+        _err "Usage: aictl bench raw <model> [options]  (try: aictl bench raw --help)"
+        exit 1
+    fi
+
+    # Safety check: warn if models are loaded in memory
+    if _llama_alive; then
+        local running
+        running=$(_api "/running" 2>/dev/null || echo "{}")
+        if echo "$running" | jq -e '.running | length > 0' > /dev/null 2>&1; then
+            _warn "Models loaded in llama-swap may affect results and memory:"
+            echo "$running" | jq -r '.running[] | "  \(.model)  [\(.state)]"'
+            echo -e "  Consider running: ${BOLD}aictl unload${NC} before raw benchmarking\n"
+        fi
+    fi
+
+    local total=${#models[@]} current=0
+    for m in "${models[@]}"; do
+        current=$(( current + 1 ))
+        local gguf_path
+        gguf_path=$(_resolve_model_path "$m" || true)
+        if [[ -z "$gguf_path" ]]; then
+            _err "Could not resolve GGUF path for '${m}' - skipping"
+            continue
+        fi
+
+        if [[ $total -gt 1 ]]; then
+            _header "${m}  (${current}/${total})"
+        else
+            _header "${m}"
+        fi
+        echo -e "  GGUF: ${gguf_path}"
+        echo -e "  pp: ${prompt_sizes}  tg: ${gen_tokens}  reps: ${reps}\n"
+
+        podman run --rm \
+            --network=host \
+            --device=/dev/kfd --device=/dev/dri \
+            --security-opt=label=disable \
+            --group-add=video --group-add=render \
+            -v /sys:/sys:ro -v /dev:/dev \
+            -v "${MODELS_PATH}:/models:rw,Z" \
+            -e "HSA_ENABLE_SDMA=0" \
+            -e "ROCBLAS_USE_HIPBLASLT=1" \
+            "${BENCH_IMAGE}" \
+            llama-bench \
+                -m "${gguf_path}" \
+                -ngl 999 \
+                -fa 1 \
+                -p "${prompt_sizes}" \
+                -n "${gen_tokens}" \
+                -r "${reps}" \
+                -o "${output_format}" \
+                --progress
+        echo ""
+    done
+}
+
+_run_speed_bench() {
+    local model="${1:-main}"
+    shift || true
+    if [[ "$model" == "--all" ]]; then
+        for m in main think flash; do
+            echo -e "\n${BOLD}${BLUE}=== Speed & Latency Benchmark: ${m} ===${NC}"
+            python3 "$SCRIPT_DIR/benchmarks/bench.py" "$m" "$@"
+        done
+    else
+        python3 "$SCRIPT_DIR/benchmarks/bench.py" "$model" "$@"
+    fi
+}
+
+_run_reasoning_bench() {
+    python3 "$SCRIPT_DIR/benchmarks/eval_reasoning.py" "$@"
+}
+
+cmd_bench() {
+    case "${1:-}" in
+        reason|reasoning|logic|eval)
+            shift
+            _run_reasoning_bench "$@"
+            ;;
+        speed|throughput|tok_s)
+            shift
+            _run_speed_bench "$@"
+            ;;
+        raw|llama|llama-bench)
+            shift
+            _run_raw_llama_bench "$@"
+            ;;
+        -h|--help)
+            echo -e "${BOLD}Usage:${NC}  aictl bench [suite] [model] [options]"
+            echo -e "        aictl bench [model] [options]  (defaults to speed/throughput)"
+            echo ""
+            echo -e "${BOLD}Benchmark Suites:${NC}"
+            echo "  reason, eval        Official lm-evaluation-harness (GSM8K, Minerva, ARC, IFEval)"
+            echo "  speed, tok_s        Serial tok/s, PP ingestion, bandwidth & MTP (default)"
+            echo "  raw                 Isolated containerized llama-bench"
+            echo ""
+            echo -e "${BOLD}Examples:${NC}"
+            echo "  aictl bench think                        # Speed benchmark on think"
+            echo "  aictl bench reason think --tasks gsm8k   # lm-eval GSM8K on think"
+            echo "  aictl bench reason think --tasks ifeval  # lm-eval IFEval on think"
+            echo "  aictl bench raw main                     # Raw containerized llama-bench"
+            return 0
+            ;;
+        *)
+            _run_speed_bench "$@"
+            ;;
+    esac
+}
+
+# =============================================================================
+# UPDATE COMMAND
+# =============================================================================
+
+cmd_update() {
+    local component="${1:-all}"
+    case "$component" in
+        all)
+            cmd_update rocm
+            cmd_update searxng
+            cmd_update webui
+            cmd_update swap
+            ;;
+        rocm)
+            _header "Updating ROCm container (${ROCM_IMAGE})"
+            local old_id new_id
+            old_id=$(podman images -q "$ROCM_IMAGE" 2>/dev/null || true)
+            podman pull "$ROCM_IMAGE"
+            new_id=$(podman images -q "$ROCM_IMAGE" 2>/dev/null || true)
+            if [[ "$old_id" != "$new_id" ]]; then
+                _ok "${ROCM_IMAGE##*:} updated. Restart llama-swap: aictl restart"
+            else
+                echo "  ${ROCM_IMAGE##*:} already up to date."
+            fi
+            ;;
+        searxng)
+            _header "Updating SearxNG"
+            podman-compose -f "$COMPOSE_FILE" pull searxng
+            podman-compose -f "$COMPOSE_FILE" up -d searxng
+            _ok "SearxNG updated and restarted."
+            ;;
+        open-webui|webui|vane)
+            _header "Updating Open WebUI"
+            podman-compose -f "$COMPOSE_FILE" pull open-webui
+            podman-compose -f "$COMPOSE_FILE" up -d open-webui
+            _ok "Open WebUI updated and restarted."
+            ;;
+        swap)
+            _header "Checking llama-swap-bin updates"
+            if command -v paru >/dev/null 2>&1 && paru -Qu llama-swap-bin 2>/dev/null | grep -q llama-swap-bin; then
+                echo "Update available in AUR. Installing..."
+                paru -S --noconfirm llama-swap-bin
+                _ok "llama-swap-bin updated. Restart: aictl restart"
+            else
+                echo "  llama-swap-bin is up to date (current: $(/usr/bin/llama-swap --version 2>&1 || true))."
+            fi
+            ;;
+        *)
+            _err "Unknown component: $component"
+            echo "  Usage: aictl update [all|rocm|searxng|webui|swap]"
+            exit 1
+            ;;
+    esac
+}
+
+cmd_top() {
+    echo "Press Ctrl+C to exit aictl top..."
+    trap 'echo ""; exit 0' INT
+
+    while true; do
+        if command -v clear >/dev/null 2>&1; then
+            clear
+        else
+            echo -e "\033[2J\033[H"
+        fi
+        echo -e "${BOLD}${BLUE}=== aictl top — Local AI Real-Time Telemetry ===${NC}  $(date '+%H:%M:%S')"
+        _print_telemetry
+
+        echo -e "\n${BOLD}Active Models in RAM:${NC}"
+        if _llama_alive; then
+            local running
+            running=$(_api "/running" 2>/dev/null || echo "{}")
+            if echo "$running" | jq -e '.running | length > 0' > /dev/null 2>&1; then
+                echo "$running" | jq -r '.running[] | "  \u001b[32m●\u001b[0m \(.model) (\(.name // "unknown")) [\(.state)] ttl=\(.ttl)s"'
+            else
+                echo -e "  ${YELLOW}○ (none active — 0 GB AI allocation / gaming mode)${NC}"
+            fi
+        else
+            echo -e "  ${RED}✗ llama-swap not responding${NC}"
+        fi
+
+        echo -e "\n${BOLD}Containers:${NC}"
+        local c_out
+        c_out=$(podman ps --format "  {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null | grep -E "searxng|open-webui|speaches|rocm" || true)
+        if [[ -n "$c_out" ]]; then
+            echo "$c_out"
+        else
+            echo "  (none)"
+        fi
+
+        sleep 1.5
+    done
+}
+
+# =============================================================================
+# HELP & DISPATCH
+# =============================================================================
+
+cmd_help() {
+    echo -e "${BOLD}aictl${NC} - AI Stack Controller"
+    echo ""
+    echo -e "${BOLD}Usage:${NC}  aictl <command> [args]"
+    echo ""
+    echo -e "${BOLD}Service Commands:${NC}"
+    echo "  start                 Start llama-swap + ai-stack (SearxNG, Redis, Open WebUI, Speaches)"
+    echo "  stop                  Stop llama-swap + ai-stack"
+    echo "  restart               Restart llama-swap + ai-stack"
+    echo "  status                Show service status, telemetry & loaded models"
+    echo "  doctor, check         Run comprehensive health & connectivity diagnostics"
+    echo "  top                   Real-time interactive telemetry monitor"
+    echo "  logs [service]        Follow logs (llama-swap|searxng|redis|open-webui|speaches)"
+    echo ""
+    echo -e "${BOLD}Model Commands:${NC}"
+    echo "  models [--json]       List models with loaded status"
+    echo "  test [model] [prompt]   Safe single-stream inference check with timings"
+    echo "  warmup [model] [--all]  Warm model weights + KV cache (default: main)"
+    echo "  swap <model>            Preload a model into memory"
+    echo "  unload [model]        Unload model (or all models if no arg)"
+    echo "  download <targets...> Multi-stream chunk download from Hugging Face (turbo)"
+    echo ""
+    echo -e "${BOLD}Info & Benchmarks:${NC}"
+    echo "  mem                       Show RAM, GTT aperture, VRAM, and loaded models"
+    echo "  bench [model]             Benchmark serial tok/s, TTFT, bandwidth & MTP (bench.py)"
+    echo "  bench code [model]        Benchmark code synthesis via EvalPlus (HumanEval/MBPP)"
+    echo "  bench reason [model]      Benchmark multi-step reasoning via lm-eval (GSM8K/MATH)"
+    echo "  bench swarm               Run collaborative multi-agent swarm benchmark"
+    echo "  bench load [model]        Run multi-slot concurrency & stress sweep"
+    echo "  bench raw <model>         Run low-level isolated llama-bench in container"
+    echo "  bench --help              Show detailed benchmark suite help and options"
+    echo ""
+    echo -e "${BOLD}Update Commands:${NC}"
+    echo "  update [component]    Update stack (all|rocm|searxng|webui|swap)"
+    echo ""
+    echo -e "${BOLD}Endpoints:${NC}"
+    echo "  llama-swap   ${LLAMA_SWAP_URL}        (model API + UI)"
+    echo "  SearxNG      http://localhost:8085"
+    echo "  Open WebUI   http://localhost:3001"
+    echo ""
+}
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+    start)            cmd_start ;;
+    stop)             cmd_stop ;;
+    restart)          cmd_restart ;;
+    status)           cmd_status ;;
+    doctor|check)     cmd_doctor "$@" ;;
+    top)              cmd_top ;;
+    logs)             cmd_logs "${1:-}" ;;
+    models)           cmd_models "$@" ;;
+    test)             cmd_test "$@" ;;
+    warmup)           cmd_warmup "$@" ;;
+    swap)             cmd_swap "${1:-}" ;;
+    unload)           cmd_unload "${1:-}" ;;
+    download|pull)    cmd_download "$@" ;;
+    mem)              cmd_mem ;;
+    bench)            cmd_bench "$@" ;;
+    update)           cmd_update "${1:-all}" ;;
+    help|--help|-h)   cmd_help ;;
+    *)
+        _err "Unknown command: $CMD"
+        echo ""
+        cmd_help
+        exit 1
+        ;;
+esac
+

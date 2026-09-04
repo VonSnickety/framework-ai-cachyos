@@ -1,0 +1,327 @@
+# =============================================================================
+# llama-swap Configuration - Framework Desktop (Strix Halo)
+# =============================================================================
+# ROCm 10 with native gfx1151 support
+#
+# Model IDs are stable semantic names (main, think, flash, embed, rerank, tiny).
+# The underlying GGUF/quant lives in the macro — only that changes on upgrade.
+
+startPort: 10001
+healthCheckTimeout: 600
+logLevel: INFO
+metricsMaxInMemory: 1000
+sendLoadingState: true
+# API key auth disabled — local-only service on the home network.
+
+# =============================================================================
+# MACROS
+# =============================================================================
+macros:
+
+  # ---------------------------------------------------------------------------
+  # Host directory where local GGUF model weights are stored.
+  # Mounted to /models in all container runners. Update this to your local path:
+  # ---------------------------------------------------------------------------
+  models-path: /mnt/AI-AND-GAMES/ai-models
+
+  # ---------------------------------------------------------------------------
+  # COMMON CONTAINER BASE
+  # ---------------------------------------------------------------------------
+  kyuz0-common: >
+    podman run --rm
+    --network=host
+    --device=/dev/kfd
+    --device=/dev/dri
+    --security-opt=label=disable
+    --group-add=video
+    --group-add=render
+    -v /sys:/sys:ro
+    -v /dev:/dev
+    -v ${models-path}:/models:rw,Z
+    -e "LLAMA_CACHE=/models"
+
+  # ---------------------------------------------------------------------------
+  # BACKEND: ROCm 10 (Official AMD ROCm Core SDK for gfx1151 / Strix Halo)
+  # ---------------------------------------------------------------------------
+  kyuz0-rocm: >
+    ${kyuz0-common}
+    --name rocm-${PORT}
+    -e "HSA_ENABLE_SDMA=0"
+    -e "ROCBLAS_USE_HIPBLASLT=1"
+    docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0
+
+
+  # ---------------------------------------------------------------------------
+  # LLAMA SERVER BASE FLAGS
+  # ---------------------------------------------------------------------------
+  llama-server-core: >
+    llama-server
+    --host 0.0.0.0
+    --port ${PORT}
+    -ngl 999
+    --cont-batching
+    -t 8
+    -tb 16
+    --no-warmup
+    --context-shift
+    --flash-attn on
+    --cache-reuse 256
+    --cache-type-k q8_0
+    --cache-type-v q8_0
+    --load-mode auto
+    --no-host
+    --prio 2
+
+  # Batch geometry for generation models (-ub 1024 boosts MoE prefill)
+  llama-server-base: >
+    ${llama-server-core}
+    -b 4096
+    -ub 1024
+
+  # Chat models need jinja + raw thinking content preservation
+  llama-server-chat: >
+    ${llama-server-base}
+    --jinja
+    --reasoning-format none
+
+  # =========================================================================
+  # MODEL CONFIGURATIONS
+  # =========================================================================
+  # Speculative Decoding:
+  #   main & think: draft-mtp (embedded multi-token prediction draft heads)
+  #   flash: ngram-simple (n=8, m=64)
+  # =========================================================================
+
+  # Qwen3.6-35B-A3B MTP — speculative decoding via embedded MTP heads
+  # Unsloth UD-Q8_K_XL (36.4 GiB weights). mmproj for vision.
+  #
+  # ctx-size is TOTAL and is divided across slots by llama.cpp:
+  #   ctx-size 524288 / np 2 = 262144 per slot (verify: `n_ctx_slot` at startup).
+  # spec-draft-n-max: 4 / p-min: 0.75 (Tuned 2026-08-28: 195.6 tok/s refactor, 97.4 tok/s edit).
+  qwen36-35b-mtp-model: >
+    -m /models/qwen36-35b-mtp/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf
+    --mmproj /models/qwen36-35b-mtp/mmproj-BF16.gguf
+    --image-min-tokens 1024
+    --ctx-size 524288
+    --spec-type draft-mtp
+    --spec-draft-n-max 4
+    --spec-draft-p-min 0.75
+    --spec-draft-backend-sampling
+    --cache-ram 8192
+    --samplers min_p;top_p;temp
+    --temp 0.6
+    --top-p 0.95
+    --min-p 0.05
+
+  # Qwen3.8-27B UD-Q6_K_XL — live in `think`. Unsloth Dynamic v3.0 requant as of 2026-08-21
+  # (25.3 GB, up from v2.0's 23.5 GB; old file kept as .v2-backup). Tuned 2026-08-28:
+  # n-max=6 / p-min=0.6 raised file-edit from 15.8 -> 23.3 tok/s (+47.8%) and MTP accept to 84.1%.
+  qwen38-27b-ud-q6-model: >
+    -m /models/qwen38-27b/Qwen3.8-27B-UD-Q6_K_XL.gguf
+    --mmproj /models/qwen38-27b/mmproj-BF16.gguf
+    --image-min-tokens 1024
+    --ctx-size 262144
+    --cache-ram 8192
+    --spec-type draft-mtp
+    --spec-draft-n-max 6
+    --spec-draft-p-min 0.6
+    -sps 0.30
+    --samplers min_p;top_p;temp
+    --temp 0.6
+    --top-p 0.95
+    --min-p 0.05
+
+
+
+
+
+
+  # BGE-M3 Multilingual Embedding Model (dense/sparse vector RAG)
+  # 8192 context, ~0.6 GiB memory footprint. Zero-eviction resident/on-demand.
+  # BOTH -b and -ub are required: llama.cpp clamps the physical batch to n_batch,
+  # so a -ub 8192 override alone was silently capped at 4096 and 500'd on any
+  # larger input. The model entry uses ${llama-server-core} (no batch flags)
+  # rather than ${llama-server-base} (-b 4096 -ub 1024), so these are set exactly
+  # once — b10603 deprecated repeating an argument and warned that only the last
+  # value would be used, which would have made this a silent regression if that
+  # last-wins behaviour were ever dropped.
+  bge-m3-model: >
+    -m /models/bge-m3/bge-m3-q8_0.gguf
+    --ctx-size 8192
+    --embedding
+    -b 8192
+    -ub 8192
+
+  # BGE-Reranker-v2-M3 (Cross-Encoder for RAG Search Reranking)
+  bge-reranker-model: >
+    -m /models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q8_0.gguf
+    --ctx-size 8192
+    --reranking
+    -b 8192
+    -ub 8192
+
+  # Qwen3.5-4B-Instruct (Zero-Eviction Fast Micro-Tier, Vision, & Titling)
+  # 131K context, ~4.8 GiB memory footprint. Blazing fast titling, commit generation, and subtasks.
+  qwen35-4b-model: >
+    -m /models/qwen35-4b/Qwen3.5-4B-Q8_0.gguf
+    --mmproj /models/qwen35-4b/mmproj-BF16.gguf
+    --image-min-tokens 1024
+    --ctx-size 131072
+    --cache-ram 4096
+    --samplers min_p;top_p;temp
+    --temp 0.6
+    --top-p 0.95
+    --min-p 0.05
+
+
+
+  # ---------------------------------------------------------------------------
+  # RUNNER: Qwen4Exp (Flash-Next)
+  # - No 16GB prefix cache (--cache-ram 0) to preserve APU memory
+  # - Standard f16 KV cache (avoids PR #27742 KV quant issues)
+  # - 51B N-gram lookup table pinned to CPU host RAM (-ot per_layer_token_embd=CPU)
+  # - Batch geometry: -b 4096 -ub 1024 (tuned 2026-08-28: +17.7% prefill at 8K)
+  # ---------------------------------------------------------------------------
+  llama-server-qwen4exp: >
+    llama-server
+    --host 0.0.0.0
+    --port ${PORT}
+    -ngl 999
+    -ot "per_layer_token_embd=CPU"
+    --cont-batching
+    -b 4096
+    -ub 1024
+    -t 8
+    -tb 16
+    --no-warmup
+    --flash-attn on
+    --cache-ram 0
+    --load-mode auto
+    --prio 2
+    --jinja
+    --reasoning-format none
+
+  # Qwen3.8-Flash-Next UD-IQ4_XS (qwen4exp preview architecture)
+  # ~93.7 GB weights (3 shards) + mmproj-BF16 with optimized N-gram speculative decoding (n=8, m=64)
+  qwen38-flash-next-model: >
+    -m /models/qwen38-flash-next/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
+    --mmproj /models/qwen38-flash-next/mmproj-BF16.gguf
+    --ctx-size 262144
+    --spec-type ngram-simple
+    --spec-ngram-simple-size-n 8
+    --spec-ngram-simple-size-m 64
+    --samplers min_p;top_p;temp
+    --temp 0.6
+    --top-p 0.95
+    --min-p 0.05
+
+# =============================================================================
+# MODELS (Dual Qwen Powerhouse + Zero-Eviction Embeddings)
+# =============================================================================
+models:
+
+  main:
+    name: "Qwen3.6-35B-A3B (UD-Q8_K_XL)"
+    description: "Multi-Agent Workhorse — MoE (3B active), 2 parallel slots, 262K context per slot (~200k words)"
+    aliases: ["default", "coder", "qwen"]
+    cmd: >
+      ${kyuz0-rocm}
+      ${llama-server-chat}
+      ${qwen36-35b-mtp-model}
+      -np 2
+    cmdStop: "podman stop -t 30 rocm-${PORT}"
+    # 1h idle TTL (others stay at 300s): `main` backs the always-on Artemis voice
+    # assistant, and a 300s TTL meant a ~25s cold reload on the first question
+    # after any quiet spell. Still unloads on its own well before a long gaming
+    # session or overnight — no keep-alive script needed.
+    ttl: 3600
+
+  think:
+    name: "Qwen3.8-27B (UD-Q6_K_XL Dynamic v3.0)"
+    description: "Deep Reasoning & Architecture — Dense, 1 slot, 262K context (~200k words)"
+    aliases: ["reasoning", "deep"]
+    cmd: >
+      ${kyuz0-rocm}
+      ${llama-server-chat}
+      ${qwen38-27b-ud-q6-model}
+      -np 1
+    cmdStop: "podman stop -t 30 rocm-${PORT}"
+    ttl: 300
+
+  flash:
+    name: "Qwen3.8-Flash-Next (UD-IQ4_XS)"
+    description: "Next-Gen Qwen4 Architecture Preview — Gated DeltaNet + QSA Sparse Attention (1 slot, 262K context / ~200k words)"
+    aliases: ["flash", "flash-next", "qwen4", "next"]
+    cmd: >
+      ${kyuz0-rocm}
+      ${llama-server-qwen4exp}
+      ${qwen38-flash-next-model}
+      -np 1
+    cmdStop: "podman stop -t 30 rocm-${PORT}"
+    ttl: 300
+
+  embed:
+    name: "BGE-M3 (Q8_0)"
+    description: "Multilingual embeddings & semantic search — 8192 context, ~0.6 GiB"
+    aliases: ["embedding", "embeddings", "bge-m3", "rag", "BAAI/bge-m3"]
+    cmd: >
+      ${kyuz0-rocm}
+      ${llama-server-core}
+      ${bge-m3-model}
+    cmdStop: "podman stop -t 15 rocm-${PORT}"
+    ttl: 300
+
+  rerank:
+    name: "BGE-Reranker-v2-M3 (Q8_0)"
+    description: "Cross-Encoder Multilingual Reranker for High-Precision Document Retrieval — 8192 context"
+    aliases: ["reranker", "bge-rerank", "bge-reranker", "BAAI/bge-reranker-v2-m3"]
+    cmd: >
+      ${kyuz0-rocm}
+      ${llama-server-core}
+      ${bge-reranker-model}
+    cmdStop: "podman stop -t 15 rocm-${PORT}"
+    ttl: 300
+
+  tiny:
+    name: "Qwen3.5-4B (Q8_0 + Vision)"
+    description: "Zero-Eviction Fast Micro-Tier, Vision, & Titling — 131K context, ~4.8 GiB, 150+ tok/s"
+    aliases: ["tiny", "4b", "qwen-4b", "micro", "qwen35-4b"]
+    cmd: >
+      ${kyuz0-rocm}
+      ${llama-server-chat}
+      --reasoning off
+      ${qwen35-4b-model}
+      -np 2
+    cmdStop: "podman stop -t 15 rocm-${PORT}"
+    ttl: 3600
+
+
+# =============================================================================
+# MATRIX
+# =============================================================================
+#
+# Architecture: On-demand mutual exclusivity (gaming & daily PC friendly).
+# Only ONE primary generative LLM/VLM is active in RAM at any time (~45-50 GB max).
+# Zero-eviction embeddings (embed / bge-m3, ~0.6 GiB), rerankers (rerank / bge-reranker, ~0.6 GiB),
+# and fast micro-models (tiny / qwen35-4b, ~4.8 GiB) can run concurrently alongside any primary model.
+# After 1 hour (for main and tiny) or 5 minutes (for think/flash) of inactivity,
+# models automatically unload via TTL, restoring memory pool.
+#
+matrix:
+  vars:
+    m: main
+    t: think
+    f: flash
+    e: embed
+    rk: rerank
+    ty: tiny
+  evict_costs:
+    f: 5
+    t: 5
+    m: 3
+    e: 1
+    rk: 1
+    ty: 1
+  sets:
+    workers: "m | t | f | m & t | m & e | m & rk | m & ty | m & e & rk | m & e & ty | m & rk & ty | m & e & rk & ty | t & e | t & rk | t & ty | t & e & rk | t & e & ty | t & rk & ty | t & e & rk & ty | f & e | f & rk | f & ty | f & e & rk | f & e & ty | f & rk & ty | f & e & rk & ty | m & t & e | m & t & rk | m & t & ty | m & t & e & rk | m & t & e & ty | m & t & rk & ty | m & t & e & rk & ty | e | rk | ty | e & rk | e & ty | rk & ty | e & rk & ty"
+

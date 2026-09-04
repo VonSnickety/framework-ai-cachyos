@@ -1,0 +1,49 @@
+# SearxNG config (contains auto-generated secret_key)
+searxng/
+
+# Secrets / env files (API keys loaded from here, not tracked)
+*.env
+.env*
+env
+secrets/
+
+# Benchmark artifacts & raw run logs (regenerated on demand; keep local)
+benchmarks/runs/
+benchmarks/results/
+evalplus_results/
+benchmarks/.evalplus-venv/
+*.venv*
+*.log
+/tmp-bench/
+
+# Local-only notes, client configs, templates & machine scripts
+clients/
+notes/
+scratch/
+scripts/
+systemd/
+templates/
+TODO.local.md
+/AGENTS.md
+
+# Python cruft
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor cruft
+.vscode/
+.idea/
+.obsidian/
+.serena/
+*.swp
+.DS_Store
+
+# Superpowers / agent planning artifacts
+*superpowers/
+.superpowers/
+
+# Training artifacts & local cache
+outputs/
+runs/
+unsloth_compiled_cache/

@@ -1,0 +1,99 @@
+version: "3.9"
+
+volumes:
+  open-webui-data:
+    driver: local
+  speaches-cache:
+    driver: local
+
+# No networks block: every service below runs with network_mode: host, so a
+# bridge network would be declared and never attached to anything.
+
+services:
+  searxng-redis:
+    image: docker.io/library/redis:alpine
+    container_name: searxng-redis
+    network_mode: host
+    restart: unless-stopped
+    command: redis-server --port 8086 --save "" --appendonly no --bind 127.0.0.1
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "8086", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: searxng
+    network_mode: host
+    environment:
+      - SEARXNG_PORT=8085
+      - SEARXNG_BIND_ADDRESS=127.0.0.1
+    volumes:
+      - ./searxng:/etc/searxng:Z
+    restart: unless-stopped
+    depends_on:
+      searxng-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/sbin/wget", "-q", "--spider", "http://127.0.0.1:8085"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    network_mode: host
+    volumes:
+      - open-webui-data:/app/backend/data:Z
+    environment:
+      - PORT=3001
+      - WEBUI_PORT=3001
+      - ENABLE_OLLAMA_API=False
+      - OLLAMA_BASE_URL=
+      - OLLAMA_BASE_URLS=
+      - ENABLE_OPENAI_API=True
+      - OPENAI_API_BASE_URL=http://127.0.0.1:8090/v1
+      - OPENAI_API_BASE_URLS=http://127.0.0.1:8090/v1
+      - OPENAI_API_KEY=0
+      - OPENAI_API_KEYS=0
+      - DEFAULT_MODELS=main
+      - WEBUI_AUTH=True
+      - ENABLE_RAG_WEB_SEARCH=True
+      - RAG_WEB_SEARCH_ENGINE=searxng
+      - SEARXNG_QUERY_URL=http://127.0.0.1:8085/search?q=<query>&format=json
+      - RAG_EMBEDDING_ENGINE=openai
+      - RAG_OPENAI_API_BASE_URL=http://127.0.0.1:8090/v1
+      - RAG_OPENAI_API_KEY=0
+      - RAG_EMBEDDING_MODEL=embed
+      - ENABLE_RAG_HYBRID_SEARCH=True
+      - RAG_RERANKING_MODEL=BAAI/bge-reranker-v2-m3
+      - AUDIO_STT_ENGINE=openai
+      - AUDIO_STT_OPENAI_API_BASE_URL=http://127.0.0.1:8088/v1
+      - AUDIO_STT_OPENAI_API_KEY=0
+      - AUDIO_TTS_ENGINE=openai
+      - AUDIO_TTS_OPENAI_API_BASE_URL=http://127.0.0.1:8088/v1
+      - AUDIO_TTS_OPENAI_API_KEY=0
+      - AUDIO_TTS_MODEL=speaches-ai/Kokoro-82M-v1.0-ONNX
+      - AUDIO_TTS_VOICE=af_heart
+    restart: unless-stopped
+    depends_on:
+      searxng:
+        condition: service_healthy
+
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    container_name: speaches
+    network_mode: host
+    volumes:
+      - speaches-cache:/home/ubuntu/.cache/huggingface/hub:Z
+    environment:
+      - UVICORN_PORT=8088
+      - WHISPER__COMPUTE_TYPE=int8
+      - WHISPER__CPU_THREADS=8
+      - SPEECH_MODEL=speaches-ai/Kokoro-82M-v1.0-ONNX
+      - WHISPER_MODEL=deepdml/faster-whisper-large-v3-turbo-ct2
+    restart: unless-stopped
+    profiles:
+      - voice
