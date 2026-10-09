@@ -108,7 +108,6 @@ Two variables from older Strix Halo guides, A/B tested on ROCm 10 with llama.cpp
 - Embeddings moved from BGE-M3 to EmbeddingGemma 2: 1.5× the throughput, 1.6× lower latency, 25% smaller vectors. This needed a newer dated toolbox image for the `gemma-embedding2` architecture.
 
 **2026-10-05**
-- All llama.cpp model servers now bind to `127.0.0.1`. Before, they accepted unauthenticated requests on their own ports.
 - SearXNG: turned off engines that returned off-topic results. Coding queries went from 8/12 on topic to 12/12.
 
 **2026-10-03**
